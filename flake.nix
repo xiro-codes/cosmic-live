@@ -54,8 +54,8 @@
         in
         {
           formatter = pkgs.nixfmt;
-          packages.default = pkgsWithRust.rustPlatform.buildRustPackage {
-            pname = "cosmic-live";
+          packages.default = pkgsWithRust.rustPlatform.buildRustPackage rec {
+            pname = "caelestia-live";
             version = "0.1.0";
             src = ./.;
             cargoLock = {
@@ -66,7 +66,7 @@
 
             postInstall = ''
               cp -r assets $out/bin/ || true
-              wrapProgram $out/bin/cosmic-live \
+              wrapProgram $out/bin/${pname}\
                 --prefix LD_LIBRARY_PATH : "${makeLibraryPath buildInputs}"
             '';
             meta.mainProgram = "cosmic-live";

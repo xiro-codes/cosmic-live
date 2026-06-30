@@ -1,4 +1,4 @@
-# Cosmic Live Wallpaper
+# Caelestia Live Wallpaper
 animated live wallpaper built in Rust using the [Bevy](https://bevyengine.org/) game engine.
 
 ## Features
