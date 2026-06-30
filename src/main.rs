@@ -10,20 +10,45 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
-    let colors = cli.wallpaper.as_ref().map(|p| extract_colors_from_wallpaper(p)).unwrap_or_default();
 
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
+    let mut app = App::new();
+
+    if let Some(wallpaper_path) = cli.wallpaper {
+        let colors = extract_colors_from_wallpaper(&wallpaper_path);
+        app.insert_resource(colors.clone());
+        app.insert_resource(ClearColor(colors.bg));
+    } else if let Ok(home) = std::env::var("HOME") {
+        let scheme_path = format!("{}/.local/state/caelestia/scheme.json", home);
+        let colors = load_scheme_colors(&scheme_path);
+
+        app.insert_resource(colors.clone());
+        app.insert_resource(ClearColor(colors.bg));
+
+        app.insert_resource(SchemeWatcher {
+            path: scheme_path.clone(),
+            last_modified: std::fs::metadata(&scheme_path)
+                .and_then(|m| m.modified())
+                .unwrap_or_else(|_| std::time::SystemTime::now()),
+            timer: Timer::from_seconds(1.0, TimerMode::Repeating),
+        });
+
+        app.add_systems(Update, watch_scheme);
+    } else {
+        eprintln!("Warning: HOME environment variable not set. Using default colors.");
+        let colors = SchemeColors::default();
+        app.insert_resource(colors.clone());
+        app.insert_resource(ClearColor(colors.bg));
+    }
+
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: None,
             exit_condition: bevy::window::ExitCondition::DontExit,
             ..default()
         }))
         .add_plugins(bevy_live_wallpaper::LiveWallpaperPlugin::default())
         .add_plugins(bevy_ecs_svg::SvgPlugin)
-        .insert_resource(colors.clone())
-        .insert_resource(ClearColor(colors.bg)) // Scheme background
         .add_systems(Startup, setup)
-        .add_systems(Update, (animate_scene, attach_animations_to_svg, scale_svg_to_window, propagate_svg_styles))
+        .add_systems(Update, (animate_scene, attach_animations_to_svg, scale_svg_to_window, propagate_svg_styles, apply_theme_colors))
         .run();
 }
 
@@ -55,6 +80,31 @@ pub struct SchemeColors {
     indigo: Color,
     light_purple: Color,
     star_white: Color,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThemeColor {
+    DeepViolet,
+    RoyalBlue,
+    PastelPink,
+    VibrantPurple,
+    Indigo,
+    LightPurple,
+    StarWhite,
+}
+
+impl SchemeColors {
+    fn get(&self, theme: ThemeColor) -> Color {
+        match theme {
+            ThemeColor::DeepViolet => self.deep_violet,
+            ThemeColor::RoyalBlue => self.royal_blue,
+            ThemeColor::PastelPink => self.pastel_pink,
+            ThemeColor::VibrantPurple => self.vibrant_purple,
+            ThemeColor::Indigo => self.indigo,
+            ThemeColor::LightPurple => self.light_purple,
+            ThemeColor::StarWhite => self.star_white,
+        }
+    }
 }
 
 impl Default for SchemeColors {
@@ -158,6 +208,85 @@ fn extract_colors_from_wallpaper(path: &str) -> SchemeColors {
     colors
 }
 
+fn load_scheme_colors(path: &str) -> SchemeColors {
+    let mut colors = SchemeColors::default();
+
+    if let Ok(content) = std::fs::read_to_string(path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            let get_col = |key: &str, fallback: Color| -> Color {
+                if let Some(hex) = json
+                    .get("colours")
+                    .and_then(|c| c.get(key))
+                    .and_then(|s| s.as_str())
+                {
+                    if let Ok(color) = bevy::color::Srgba::hex(hex) {
+                        return Color::from(color);
+                    }
+                }
+                fallback
+            };
+
+            colors.bg = get_col("crust", colors.bg);
+            colors.deep_violet = get_col("base", colors.deep_violet);
+            colors.royal_blue = get_col("blue", colors.royal_blue);
+            colors.pastel_pink = get_col("pink", colors.pastel_pink);
+            colors.vibrant_purple = get_col("mauve", colors.vibrant_purple);
+            colors.indigo = get_col("sapphire", colors.indigo);
+            colors.light_purple = get_col("lavender", colors.light_purple);
+            colors.star_white = get_col("text", colors.star_white);
+        }
+    }
+
+    colors
+}
+
+#[derive(Resource)]
+struct SchemeWatcher {
+    path: String,
+    last_modified: std::time::SystemTime,
+    timer: Timer,
+}
+
+fn watch_scheme(
+    time: Res<Time>,
+    mut watcher: ResMut<SchemeWatcher>,
+    mut clear_color: ResMut<ClearColor>,
+    mut colors_res: ResMut<SchemeColors>,
+) {
+    if watcher.timer.tick(time.delta()).just_finished() {
+        if let Ok(metadata) = std::fs::metadata(&watcher.path) {
+            if let Ok(modified) = metadata.modified() {
+                if modified > watcher.last_modified {
+                    watcher.last_modified = modified;
+                    let new_colors = load_scheme_colors(&watcher.path);
+
+                    clear_color.0 = new_colors.bg;
+                    *colors_res = new_colors;
+                }
+            }
+        }
+    }
+}
+
+fn apply_theme_colors(
+    colors: Res<SchemeColors>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    query: Query<(&ActiveThemeColor, &MeshMaterial2d<ColorMaterial>)>,
+) {
+    if colors.is_changed() {
+        for (theme_color, mat_handle) in query.iter() {
+            if let Some(mut mat) = materials.get_mut(&mat_handle.0) {
+                let mut new_c = colors.get(theme_color.0);
+                
+                // Preserve the alpha if it's currently set (e.g. for twinkling stars)
+                let current_alpha = mat.color.alpha();
+                new_c.set_alpha(current_alpha);
+                mat.color = new_c;
+            }
+        }
+    }
+}
+
 
 fn setup(
     mut commands: Commands,
@@ -186,14 +315,13 @@ struct CloudRotate {
 
 #[derive(Component)]
 struct SvgStyle {
-    color: Option<Color>,
+    color: Option<ThemeColor>,
     shadow: bool,
 }
 
 fn attach_animations_to_svg(
     mut commands: Commands,
     query: Query<(Entity, &bevy_ecs_svg::SvgNode), Added<bevy_ecs_svg::SvgNode>>,
-    colors: Res<SchemeColors>,
 ) {
     let mut i = 0.0;
     for (entity, node) in query.iter() {
@@ -206,10 +334,10 @@ fn attach_animations_to_svg(
                     speed: 1.5 + (i % 2.0),
                     phase: i,
                 },
-                SvgStyle { color: Some(colors.star_white), shadow: true },
+                SvgStyle { color: Some(ThemeColor::StarWhite), shadow: true },
             ));
         } else if id.starts_with("Cloud") {
-            let cloud_color = if (i as i32) % 2 == 0 { colors.pastel_pink } else { colors.vibrant_purple };
+            let cloud_color = if (i as i32) % 2 == 0 { ThemeColor::PastelPink } else { ThemeColor::VibrantPurple };
             commands.entity(entity).insert((
                 CloudRotate {
                     speed: 0.1 + (i % 0.1),
@@ -222,14 +350,14 @@ fn attach_animations_to_svg(
                 PlanetPart {
                     bob_speed: 0.8,
                 },
-                SvgStyle { color: Some(colors.star_white), shadow: true },
+                SvgStyle { color: Some(ThemeColor::StarWhite), shadow: true },
             ));
         } else if id.starts_with("Wave") {
             let wave_color = match id.as_str() {
-                "Wave1" => colors.deep_violet,
-                "Wave2" => colors.royal_blue,
-                "Wave3" => colors.indigo,
-                _ => colors.light_purple,
+                "Wave1" => ThemeColor::DeepViolet,
+                "Wave2" => ThemeColor::RoyalBlue,
+                "Wave3" => ThemeColor::Indigo,
+                _ => ThemeColor::LightPurple,
             };
             commands.entity(entity).insert((
                 Wave {
@@ -243,20 +371,25 @@ fn attach_animations_to_svg(
     }
 }
 
+#[derive(Component)]
+struct ActiveThemeColor(ThemeColor);
+
 fn propagate_svg_styles(
     mut commands: Commands,
     roots: Query<(Entity, &SvgStyle), Added<SvgStyle>>,
     children_q: Query<&Children>,
     paths: Query<(&Mesh2d, &MeshMaterial2d<ColorMaterial>)>,
     mut materials: ResMut<Assets<ColorMaterial>>,
+    colors_res: Res<SchemeColors>,
 ) {
     for (root_entity, style) in roots.iter() {
         let mut queue = vec![root_entity];
         while let Some(entity) = queue.pop() {
             if let Ok((mesh, mat_handle)) = paths.get(entity) {
-                if let Some(color) = style.color {
+                if let Some(color_type) = style.color {
                     if let Some(mut mat) = materials.get_mut(&mat_handle.0) {
-                        mat.color = color;
+                        mat.color = colors_res.get(color_type);
+                        commands.entity(entity).insert(ActiveThemeColor(color_type));
                     }
                 }
 
@@ -287,9 +420,11 @@ fn propagate_svg_styles(
 fn animate_scene(
     time: Res<Time>,
     mut waves: Query<(&mut Transform, &Wave), (Without<StarTwinkle>, Without<PlanetPart>, Without<CloudRotate>)>,
-    mut stars: Query<(&MeshMaterial2d<ColorMaterial>, &StarTwinkle), (Without<Wave>, Without<PlanetPart>, Without<CloudRotate>)>,
+    mut stars: Query<(Entity, &mut Transform, &StarTwinkle), (Without<Wave>, Without<PlanetPart>, Without<CloudRotate>)>,
     mut planets: Query<(&mut Transform, &PlanetPart), (Without<Wave>, Without<StarTwinkle>, Without<CloudRotate>)>,
     mut clouds: Query<(&mut Transform, &CloudRotate), (Without<Wave>, Without<StarTwinkle>, Without<PlanetPart>)>,
+    children_q: Query<&Children>,
+    paths: Query<&MeshMaterial2d<ColorMaterial>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
     let t = time.elapsed_secs();
@@ -302,17 +437,32 @@ fn animate_scene(
         transform.translation.y = shift_y;
     }
 
-    // Stars should twinkle (opacity)
-    for (mat_handle, star) in stars.iter_mut() {
-        if let Some(mut mat) = materials.get_mut(&mat_handle.0) {
-            let alpha = star.base_scale * 0.5 + (t * star.speed + star.phase).sin() * 0.5;
-            mat.color.set_alpha(alpha.clamp(0.0, 1.0));
+    // Stars should twinkle (opacity), rotate, and bob
+    for (entity, mut transform, star) in stars.iter_mut() {
+        let mut queue = vec![entity];
+        while let Some(e) = queue.pop() {
+            if let Ok(mat_handle) = paths.get(e) {
+                if let Some(mut mat) = materials.get_mut(&mat_handle.0) {
+                    let alpha = star.base_scale * 0.5 + (t * star.speed * 0.4 + star.phase).sin() * 0.5;
+                    mat.color.set_alpha(alpha.clamp(0.0, 1.0));
+                }
+            }
+            if let Ok(children) = children_q.get(e) {
+                for child in children.iter() {
+                    queue.push(child);
+                }
+            }
         }
+        
+        let rotation = (t * star.speed * 0.2 + star.phase).sin() * 0.1;
+        let bob = (t * star.speed * 0.3 + star.phase).sin() * 1.5;
+        transform.rotation = Quat::from_rotation_z(rotation);
+        transform.translation.y = bob;
     }
 
     // Logo should wobble (bob + rotate)
     for (mut transform, planet) in planets.iter_mut() {
-        let bob = (t * planet.bob_speed).sin() * 15.0;
+        let bob = (t * planet.bob_speed).sin() * 8.0;
         let wobble = (t * planet.bob_speed * 0.5).sin() * 0.05;
         transform.translation.y = bob;
         transform.rotation = Quat::from_rotation_z(wobble);
