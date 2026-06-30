@@ -1,9 +1,16 @@
 use bevy::prelude::*;
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    #[arg(short, long)]
+    wallpaper: Option<String>,
+}
 
 fn main() {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/tod".to_string());
-    let scheme_path = format!("{}/.local/state/caelestia/scheme.json", home);
-    let colors = load_scheme_colors(&scheme_path);
+    let cli = Cli::parse();
+    let colors = cli.wallpaper.as_ref().map(|p| extract_colors_from_wallpaper(p)).unwrap_or_default();
 
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -12,9 +19,10 @@ fn main() {
             ..default()
         }))
         .add_plugins(bevy_live_wallpaper::LiveWallpaperPlugin::default())
+        .insert_resource(colors.clone())
         .insert_resource(ClearColor(colors.bg)) // Scheme background
         .add_systems(Startup, setup)
-        .add_systems(Update, (animate_scene, watch_scheme))
+        .add_systems(Update, animate_scene)
         .run();
 }
 
@@ -39,7 +47,8 @@ struct PlanetPart {
     spin_speed: f32,
 }
 
-struct SchemeColors {
+#[derive(Resource, Clone)]
+pub struct SchemeColors {
     bg: Color,
     deep_violet: Color,
     royal_blue: Color,
@@ -65,68 +74,100 @@ impl Default for SchemeColors {
     }
 }
 
-fn load_scheme_colors(path: &str) -> SchemeColors {
+fn extract_colors_from_wallpaper(path: &str) -> SchemeColors {
     let mut colors = SchemeColors::default();
 
-    if let Ok(content) = std::fs::read_to_string(path) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-            let get_col = |key: &str, fallback: Color| -> Color {
-                if let Some(hex) = json
-                    .get("colours")
-                    .and_then(|c| c.get(key))
-                    .and_then(|s| s.as_str())
-                {
-                    if let Ok(color) = bevy::color::Srgba::hex(hex) {
-                        return Color::from(color);
+    if let Ok(bytes) = std::fs::read(path) {
+        if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+            let img_resized = dyn_img.resize_exact(32, 32, image::imageops::FilterType::Triangle);
+            let mut pixels: Vec<_> = img_resized.to_rgba8().pixels().map(|p| p.0).collect();
+
+            pixels.sort_by(|a, b| {
+                let max_a = a[0].max(a[1]).max(a[2]) as f32;
+                let min_a = a[0].min(a[1]).min(a[2]) as f32;
+                let sat_a = if max_a == 0.0 { 0.0 } else { (max_a - min_a) / max_a };
+
+                let max_b = b[0].max(b[1]).max(b[2]) as f32;
+                let min_b = b[0].min(b[1]).min(b[2]) as f32;
+                let sat_b = if max_b == 0.0 { 0.0 } else { (max_b - min_b) / max_b };
+
+                sat_b.partial_cmp(&sat_a).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            let mut chosen_colors = Vec::new();
+            let mut target_dist = 0.5;
+
+            while chosen_colors.len() < 8 && target_dist >= 0.0 {
+                for p in &pixels {
+                    let color = Color::srgba(
+                        p[0] as f32 / 255.0,
+                        p[1] as f32 / 255.0,
+                        p[2] as f32 / 255.0,
+                        1.0,
+                    );
+
+                    let mut similar = false;
+                    for c in &chosen_colors {
+                        let c: Color = *c;
+                        let srgba1 = color.to_srgba();
+                        let srgba2 = c.to_srgba();
+                        let dist = (srgba1.red - srgba2.red).abs()
+                            + (srgba1.green - srgba2.green).abs()
+                            + (srgba1.blue - srgba2.blue).abs();
+                        if dist < target_dist {
+                            similar = true;
+                            break;
+                        }
+                    }
+
+                    if !similar {
+                        chosen_colors.push(color);
+                        if chosen_colors.len() == 8 {
+                            break;
+                        }
                     }
                 }
-                fallback
-            };
+                target_dist -= 0.05;
+            }
 
-            colors.bg = get_col("crust", colors.bg);
-            colors.deep_violet = get_col("base", colors.deep_violet);
-            colors.royal_blue = get_col("blue", colors.royal_blue);
-            colors.pastel_pink = get_col("pink", colors.pastel_pink);
-            colors.vibrant_purple = get_col("mauve", colors.vibrant_purple);
-            colors.indigo = get_col("sapphire", colors.indigo);
-            colors.light_purple = get_col("lavender", colors.light_purple);
-            colors.star_white = get_col("text", colors.star_white);
+            if chosen_colors.len() == 8 {
+                colors.bg = chosen_colors[0];
+                colors.deep_violet = chosen_colors[1];
+                colors.royal_blue = chosen_colors[2];
+                colors.pastel_pink = chosen_colors[3];
+                colors.vibrant_purple = chosen_colors[4];
+                colors.indigo = chosen_colors[5];
+                colors.light_purple = chosen_colors[6];
+                colors.star_white = chosen_colors[7];
+            } else {
+                for (i, c) in chosen_colors.iter().enumerate() {
+                    match i {
+                        0 => colors.bg = *c,
+                        1 => colors.deep_violet = *c,
+                        2 => colors.royal_blue = *c,
+                        3 => colors.pastel_pink = *c,
+                        4 => colors.vibrant_purple = *c,
+                        5 => colors.indigo = *c,
+                        6 => colors.light_purple = *c,
+                        7 => colors.star_white = *c,
+                        _ => {}
+                    }
+                }
+            }
         }
     }
 
     colors
 }
 
-#[derive(Clone)]
-struct SchemeMaterials {
-    deep_violet: Handle<ColorMaterial>,
-    royal_blue: Handle<ColorMaterial>,
-    pastel_pink: Handle<ColorMaterial>,
-    vibrant_purple: Handle<ColorMaterial>,
-    indigo: Handle<ColorMaterial>,
-    light_purple: Handle<ColorMaterial>,
-    star_white: Handle<ColorMaterial>,
-    cloud: Handle<ColorMaterial>,
-}
-
-#[derive(Resource)]
-struct SchemeWatcher {
-    path: String,
-    last_modified: std::time::SystemTime,
-    timer: Timer,
-    materials: SchemeMaterials,
-}
 
 fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
+    colors: Res<SchemeColors>,
 ) {
     commands.spawn((Camera2d, bevy_live_wallpaper::LiveWallpaperCamera));
-
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/tod".to_string());
-    let scheme_path = format!("{}/.local/state/caelestia/scheme.json", home);
-    let colors = load_scheme_colors(&scheme_path);
 
     let deep_violet_mat = materials.add(ColorMaterial::from(colors.deep_violet));
     let royal_blue_mat = materials.add(ColorMaterial::from(colors.royal_blue));
@@ -136,35 +177,6 @@ fn setup(
     let light_purple_mat = materials.add(ColorMaterial::from(colors.light_purple));
     let star_white_mat = materials.add(ColorMaterial::from(colors.star_white));
     let shadow_color = Color::srgba(0.0, 0.0, 0.0, 0.6);
-
-    let cloud_rgba = match colors.light_purple {
-        Color::Srgba(c) => c,
-        _ => bevy::color::Srgba::new(0.8, 0.5, 0.8, 1.0),
-    };
-    let cloud_mat = materials.add(ColorMaterial::from(Color::srgba(
-        cloud_rgba.red,
-        cloud_rgba.green,
-        cloud_rgba.blue,
-        0.15,
-    )));
-
-    commands.insert_resource(SchemeWatcher {
-        path: scheme_path.clone(),
-        last_modified: std::fs::metadata(&scheme_path)
-            .and_then(|m| m.modified())
-            .unwrap_or_else(|_| std::time::SystemTime::now()),
-        timer: Timer::from_seconds(1.0, TimerMode::Repeating),
-        materials: SchemeMaterials {
-            deep_violet: deep_violet_mat.clone(),
-            royal_blue: royal_blue_mat.clone(),
-            pastel_pink: pastel_pink_mat.clone(),
-            vibrant_purple: vibrant_purple_mat.clone(),
-            indigo: indigo_mat.clone(),
-            light_purple: light_purple_mat.clone(),
-            star_white: star_white_mat.clone(),
-            cloud: cloud_mat.clone(),
-        },
-    });
 
     let screen_w = 4000.0;
     let bottom_y = -2000.0;
@@ -321,110 +333,6 @@ fn setup(
         ));
     }
 
-    // Clouds in the corners
-
-    let cloud_clusters = vec![
-        (
-            -1200.0,
-            600.0,
-            vec![
-                (0.0, 0.0, 120.0),
-                (80.0, -40.0, 100.0),
-                (40.0, -80.0, 90.0),
-                (140.0, -20.0, 70.0),
-            ],
-        ),
-        (
-            1200.0,
-            600.0,
-            vec![
-                (0.0, 0.0, 130.0),
-                (-90.0, -50.0, 110.0),
-                (-40.0, -100.0, 90.0),
-                (-160.0, -30.0, 60.0),
-            ],
-        ),
-        (
-            -1200.0,
-            -600.0,
-            vec![
-                (0.0, 0.0, 140.0),
-                (100.0, 40.0, 110.0),
-                (40.0, 100.0, 95.0),
-                (160.0, 20.0, 75.0),
-            ],
-        ),
-        (
-            1200.0,
-            -600.0,
-            vec![
-                (0.0, 0.0, 150.0),
-                (-110.0, 50.0, 120.0),
-                (-50.0, 110.0, 100.0),
-                (-180.0, 30.0, 80.0),
-            ],
-        ),
-    ];
-
-    for (bx, by, circles) in cloud_clusters {
-        for (dx, dy, radius) in circles {
-            commands.spawn((
-                Mesh2d(meshes.add(create_ellipse_mesh(radius, radius))),
-                MeshMaterial2d(cloud_mat.clone()),
-                Transform::from_xyz(bx + dx, by + dy, planet_z - 1.0),
-            ));
-        }
-    }
-}
-
-fn watch_scheme(
-    time: Res<Time>,
-    mut watcher: ResMut<SchemeWatcher>,
-    mut clear_color: ResMut<ClearColor>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
-) {
-    if watcher.timer.tick(time.delta()).just_finished() {
-        if let Ok(metadata) = std::fs::metadata(&watcher.path) {
-            if let Ok(modified) = metadata.modified() {
-                if modified > watcher.last_modified {
-                    watcher.last_modified = modified;
-                    let colors = load_scheme_colors(&watcher.path);
-
-                    clear_color.0 = colors.bg;
-
-                    if let Some(mut mat) = materials.get_mut(&watcher.materials.deep_violet) {
-                        mat.color = colors.deep_violet;
-                    }
-                    if let Some(mut mat) = materials.get_mut(&watcher.materials.royal_blue) {
-                        mat.color = colors.royal_blue;
-                    }
-                    if let Some(mut mat) = materials.get_mut(&watcher.materials.pastel_pink) {
-                        mat.color = colors.pastel_pink;
-                    }
-                    if let Some(mut mat) = materials.get_mut(&watcher.materials.vibrant_purple) {
-                        mat.color = colors.vibrant_purple;
-                    }
-                    if let Some(mut mat) = materials.get_mut(&watcher.materials.indigo) {
-                        mat.color = colors.indigo;
-                    }
-                    if let Some(mut mat) = materials.get_mut(&watcher.materials.light_purple) {
-                        mat.color = colors.light_purple;
-                    }
-                    if let Some(mut mat) = materials.get_mut(&watcher.materials.star_white) {
-                        mat.color = colors.star_white;
-                    }
-                    if let Some(mut mat) = materials.get_mut(&watcher.materials.cloud) {
-                        let cloud_rgba = match colors.light_purple {
-                            Color::Srgba(c) => c,
-                            _ => bevy::color::Srgba::new(0.8, 0.5, 0.8, 1.0),
-                        };
-                        mat.color =
-                            Color::srgba(cloud_rgba.red, cloud_rgba.green, cloud_rgba.blue, 0.15);
-                    }
-                }
-            }
-        }
-    }
 }
 
 fn animate_scene(
@@ -640,35 +548,6 @@ fn create_wave_mesh(
 
         indices.extend_from_slice(&[p1, p2, p3]);
         indices.extend_from_slice(&[p3, p2, p4]);
-    }
-
-    Mesh::new(
-        bevy::render::render_resource::PrimitiveTopology::TriangleList,
-        bevy::asset::RenderAssetUsages::default(),
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_indices(bevy::mesh::Indices::U32(indices))
-}
-
-fn create_ellipse_mesh(rx: f32, ry: f32) -> Mesh {
-    let mut positions = Vec::new();
-    let mut indices = Vec::new();
-    let segments = 32;
-
-    positions.push([0.0, 0.0, 0.0]); // Center
-
-    for i in 0..segments {
-        let t = (i as f32) * std::f32::consts::TAU / (segments as f32);
-        positions.push([rx * t.cos(), ry * t.sin(), 0.0]);
-    }
-
-    for i in 0..segments {
-        let a = 0;
-        let b = i + 1;
-        let c = if i == segments - 1 { 1 } else { i + 2 };
-        indices.push(a);
-        indices.push(b);
-        indices.push(c);
     }
 
     Mesh::new(
