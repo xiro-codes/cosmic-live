@@ -19,10 +19,11 @@ fn main() {
             ..default()
         }))
         .add_plugins(bevy_live_wallpaper::LiveWallpaperPlugin::default())
+        .add_plugins(bevy_ecs_svg::SvgPlugin)
         .insert_resource(colors.clone())
         .insert_resource(ClearColor(colors.bg)) // Scheme background
         .add_systems(Startup, setup)
-        .add_systems(Update, animate_scene)
+        .add_systems(Update, (animate_scene, attach_animations_to_svg, scale_svg_to_window, propagate_svg_styles))
         .run();
 }
 
@@ -41,10 +42,7 @@ struct StarTwinkle {
 
 #[derive(Component)]
 struct PlanetPart {
-    base_y: f32,
-    base_rotation: f32,
     bob_speed: f32,
-    spin_speed: f32,
 }
 
 #[derive(Resource, Clone)]
@@ -163,397 +161,191 @@ fn extract_colors_from_wallpaper(path: &str) -> SchemeColors {
 
 fn setup(
     mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
-    colors: Res<SchemeColors>,
+    asset_server: Res<AssetServer>,
 ) {
     commands.spawn((Camera2d, bevy_live_wallpaper::LiveWallpaperCamera));
 
-    let deep_violet_mat = materials.add(ColorMaterial::from(colors.deep_violet));
-    let royal_blue_mat = materials.add(ColorMaterial::from(colors.royal_blue));
-    let pastel_pink_mat = materials.add(ColorMaterial::from(colors.pastel_pink));
-    let vibrant_purple_mat = materials.add(ColorMaterial::from(colors.vibrant_purple));
-    let indigo_mat = materials.add(ColorMaterial::from(colors.indigo));
-    let light_purple_mat = materials.add(ColorMaterial::from(colors.light_purple));
-    let star_white_mat = materials.add(ColorMaterial::from(colors.star_white));
-    let shadow_color = Color::srgba(0.0, 0.0, 0.0, 0.6);
+    // Spawn the SVG
+    commands.spawn((
+        bevy_ecs_svg::SpawnSvg {
+            document: asset_server.load("shell.svg"),
+        },
+        Transform::default(),
+        GlobalTransform::default(),
+        Visibility::default(),
+        InheritedVisibility::default(),
+        ViewVisibility::default(),
+    ));
+}
 
-    let screen_w = 4000.0;
-    let bottom_y = -2000.0;
+#[derive(Component)]
+struct CloudRotate {
+    speed: f32,
+    phase: f32,
+}
 
-    // Background Waves (from back to front)
-    let wave_data = vec![
-        (deep_violet_mat, 800.0, 150.0, 1.5, 0.0, 0.2, -10.0),
-        (royal_blue_mat, 400.0, 200.0, 2.0, 1.0, 0.3, -9.0),
-        (pastel_pink_mat.clone(), 0.0, 100.0, 1.0, 2.0, 0.15, -8.0),
-        (vibrant_purple_mat, -300.0, 180.0, 2.5, 0.5, 0.25, -7.0),
-        (indigo_mat, -600.0, 250.0, 1.2, 1.5, 0.2, -6.0),
-        (light_purple_mat, -900.0, 120.0, 1.8, 0.8, 0.1, -5.0),
-    ];
+#[derive(Component)]
+struct SvgStyle {
+    color: Option<Color>,
+    shadow: bool,
+}
 
-    for (mat, base_y, amp, freq, phase, speed, z) in wave_data {
-        commands.spawn((
-            Mesh2d(meshes.add(create_wave_mesh(
-                screen_w, base_y, amp, freq, phase, bottom_y,
-            ))),
-            MeshMaterial2d(mat),
-            Transform::from_xyz(0.0, 0.0, z),
-            Wave {
-                base_phase: phase,
-                speed,
-            },
-        ));
+fn attach_animations_to_svg(
+    mut commands: Commands,
+    query: Query<(Entity, &bevy_ecs_svg::SvgNode), Added<bevy_ecs_svg::SvgNode>>,
+    colors: Res<SchemeColors>,
+) {
+    let mut i = 0.0;
+    for (entity, node) in query.iter() {
+        let id = &node.id;
+
+        if id.starts_with("Star") || id.starts_with("LogoStar") {
+            commands.entity(entity).insert((
+                StarTwinkle {
+                    base_scale: 1.0, // used as base alpha
+                    speed: 1.5 + (i % 2.0),
+                    phase: i,
+                },
+                SvgStyle { color: Some(colors.star_white), shadow: true },
+            ));
+        } else if id.starts_with("Cloud") {
+            let cloud_color = if (i as i32) % 2 == 0 { colors.pastel_pink } else { colors.vibrant_purple };
+            commands.entity(entity).insert((
+                CloudRotate {
+                    speed: 0.1 + (i % 0.1),
+                    phase: i,
+                },
+                SvgStyle { color: Some(cloud_color), shadow: false },
+            ));
+        } else if id == "Logo" {
+            commands.entity(entity).insert((
+                PlanetPart {
+                    bob_speed: 0.8,
+                },
+                SvgStyle { color: Some(colors.star_white), shadow: true },
+            ));
+        } else if id.starts_with("Wave") {
+            let wave_color = match id.as_str() {
+                "Wave1" => colors.deep_violet,
+                "Wave2" => colors.royal_blue,
+                "Wave3" => colors.indigo,
+                _ => colors.light_purple,
+            };
+            commands.entity(entity).insert((
+                Wave {
+                    base_phase: i * 0.5,
+                    speed: 0.2 + (i % 0.3),
+                },
+                SvgStyle { color: Some(wave_color), shadow: false },
+            ));
+        }
+        i += 1.0;
     }
+}
 
-    // Central Planet Logo
-    let planet_z = 0.0;
+fn propagate_svg_styles(
+    mut commands: Commands,
+    roots: Query<(Entity, &SvgStyle), Added<SvgStyle>>,
+    children_q: Query<&Children>,
+    paths: Query<(&Mesh2d, &MeshMaterial2d<ColorMaterial>)>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+) {
+    for (root_entity, style) in roots.iter() {
+        let mut queue = vec![root_entity];
+        while let Some(entity) = queue.pop() {
+            if let Ok((mesh, mat_handle)) = paths.get(entity) {
+                if let Some(color) = style.color {
+                    if let Some(mut mat) = materials.get_mut(&mat_handle.0) {
+                        mat.color = color;
+                    }
+                }
 
-    let top_crescent_mesh = meshes.add(create_crescent_mesh(true));
-    let bot_crescent_mesh = meshes.add(create_crescent_mesh(false));
-    let ring_mesh = meshes.add(create_custom_ring_mesh());
+                if style.shadow {
+                    let shadow_mat = materials.add(ColorMaterial::from(Color::srgba(0.0, 0.0, 0.0, 0.5)));
+                    let shadow = commands.spawn((
+                        Mesh2d(mesh.0.clone()),
+                        MeshMaterial2d(shadow_mat),
+                        Transform::from_xyz(10.0, -10.0, -0.1),
+                        GlobalTransform::default(),
+                        Visibility::default(),
+                        InheritedVisibility::default(),
+                        ViewVisibility::default(),
+                    )).id();
+                    commands.entity(entity).add_child(shadow);
+                }
+            }
 
-    let shadow_mat = materials.add(ColorMaterial::from(shadow_color));
-
-    // Shadows
-    commands.spawn((
-        Mesh2d(top_crescent_mesh.clone()),
-        MeshMaterial2d(shadow_mat.clone()),
-        Transform::from_xyz(15.0, -15.0, planet_z - 0.5),
-        PlanetPart {
-            base_y: -15.0,
-            base_rotation: 0.0,
-            bob_speed: 0.8,
-            spin_speed: 0.05,
-        },
-    ));
-    commands.spawn((
-        Mesh2d(bot_crescent_mesh.clone()),
-        MeshMaterial2d(shadow_mat.clone()),
-        Transform::from_xyz(15.0, -15.0, planet_z - 0.5),
-        PlanetPart {
-            base_y: -15.0,
-            base_rotation: 0.0,
-            bob_speed: 0.8,
-            spin_speed: 0.05,
-        },
-    ));
-    commands.spawn((
-        Mesh2d(ring_mesh.clone()),
-        MeshMaterial2d(shadow_mat),
-        Transform::from_xyz(15.0, -15.0, planet_z - 0.5),
-        PlanetPart {
-            base_y: -15.0,
-            base_rotation: 0.0,
-            bob_speed: 0.8,
-            spin_speed: 0.05,
-        },
-    ));
-
-    // Top Pink Crescent
-    commands.spawn((
-        Mesh2d(top_crescent_mesh),
-        MeshMaterial2d(pastel_pink_mat.clone()),
-        Transform::from_xyz(0.0, 0.0, planet_z),
-        PlanetPart {
-            base_y: 0.0,
-            base_rotation: 0.0,
-            bob_speed: 0.8,
-            spin_speed: 0.05,
-        },
-    ));
-
-    // Bottom Pink Crescent
-    commands.spawn((
-        Mesh2d(bot_crescent_mesh),
-        MeshMaterial2d(pastel_pink_mat.clone()),
-        Transform::from_xyz(0.0, 0.0, planet_z),
-        PlanetPart {
-            base_y: 0.0,
-            base_rotation: 0.0,
-            bob_speed: 0.8,
-            spin_speed: 0.05,
-        },
-    ));
-
-    // White Ring (Tilted C-shape)
-    commands.spawn((
-        Mesh2d(ring_mesh),
-        MeshMaterial2d(star_white_mat.clone()),
-        Transform::from_xyz(0.0, 0.0, planet_z + 1.0),
-        PlanetPart {
-            base_y: 0.0,
-            base_rotation: 0.0,
-            bob_speed: 0.8,
-            spin_speed: 0.05,
-        },
-    ));
-
-    // Stars
-    let stars = vec![
-        // Left side
-        (star_white_mat.clone(), 40.0, -300.0, -200.0, 2.0, 0.0),
-        (pastel_pink_mat.clone(), 20.0, -500.0, 100.0, 1.5, 1.0),
-        (pastel_pink_mat.clone(), 25.0, -250.0, 300.0, 3.0, 2.0),
-        (pastel_pink_mat.clone(), 10.0, -150.0, 150.0, 2.5, 3.0),
-        // Right side
-        (star_white_mat.clone(), 50.0, 350.0, 250.0, 1.8, 0.5),
-        (pastel_pink_mat.clone(), 15.0, 180.0, 220.0, 4.0, 1.5),
-        (pastel_pink_mat.clone(), 12.0, 220.0, 280.0, 3.5, 2.5),
-        (pastel_pink_mat.clone(), 20.0, 450.0, -100.0, 2.2, 0.8),
-        (pastel_pink_mat.clone(), 18.0, 300.0, -350.0, 1.6, 1.2),
-    ];
-
-    let star_shadow_mat = materials.add(ColorMaterial::from(shadow_color));
-
-    for (mat, radius, x, y, speed, phase) in stars {
-        let star_mesh = meshes.add(create_star_mesh(radius));
-
-        // Star Shadow
-        commands.spawn((
-            Mesh2d(star_mesh.clone()),
-            MeshMaterial2d(star_shadow_mat.clone()),
-            Transform::from_xyz(x + 5.0, y - 5.0, planet_z + 1.9),
-            StarTwinkle {
-                base_scale: 1.0,
-                speed,
-                phase,
-            },
-        ));
-
-        // Actual Star
-        commands.spawn((
-            Mesh2d(star_mesh),
-            MeshMaterial2d(mat),
-            Transform::from_xyz(x, y, planet_z + 2.0),
-            StarTwinkle {
-                base_scale: 1.0,
-                speed,
-                phase,
-            },
-        ));
+            if let Ok(children) = children_q.get(entity) {
+                for child in children.iter() {
+                    queue.push(child);
+                }
+            }
+        }
     }
-
 }
 
 fn animate_scene(
     time: Res<Time>,
-    mut waves: Query<(&mut Transform, &Wave), (Without<StarTwinkle>, Without<PlanetPart>)>,
-    mut stars: Query<(&mut Transform, &StarTwinkle), (Without<Wave>, Without<PlanetPart>)>,
-    mut planets: Query<(&mut Transform, &PlanetPart), (Without<Wave>, Without<StarTwinkle>)>,
+    mut waves: Query<(&mut Transform, &Wave), (Without<StarTwinkle>, Without<PlanetPart>, Without<CloudRotate>)>,
+    mut stars: Query<(&MeshMaterial2d<ColorMaterial>, &StarTwinkle), (Without<Wave>, Without<PlanetPart>, Without<CloudRotate>)>,
+    mut planets: Query<(&mut Transform, &PlanetPart), (Without<Wave>, Without<StarTwinkle>, Without<CloudRotate>)>,
+    mut clouds: Query<(&mut Transform, &CloudRotate), (Without<Wave>, Without<StarTwinkle>, Without<PlanetPart>)>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
     let t = time.elapsed_secs();
 
-    // Animate waves by slowly shifting them horizontally
+    // Wave should ripple (shift X and Y slightly)
     for (mut transform, wave) in waves.iter_mut() {
-        let shift = (t * wave.speed + wave.base_phase).sin() * 50.0;
-        transform.translation.x = shift;
+        let shift_x = (t * wave.speed + wave.base_phase).sin() * 50.0;
+        let shift_y = (t * wave.speed * 1.5 + wave.base_phase).cos() * 15.0;
+        transform.translation.x = shift_x;
+        transform.translation.y = shift_y;
     }
 
-    // Twinkle and spin stars
-    for (mut transform, star) in stars.iter_mut() {
-        let scale = star.base_scale + (t * star.speed + star.phase).sin() * 0.2;
-        transform.scale = Vec3::splat(scale);
-        transform.rotation = Quat::from_rotation_z(t * 0.5 * star.speed);
+    // Stars should twinkle (opacity)
+    for (mat_handle, star) in stars.iter_mut() {
+        if let Some(mut mat) = materials.get_mut(&mat_handle.0) {
+            let alpha = star.base_scale * 0.5 + (t * star.speed + star.phase).sin() * 0.5;
+            mat.color.set_alpha(alpha.clamp(0.0, 1.0));
+        }
     }
 
-    // Bob and spin planet parts
+    // Logo should wobble (bob + rotate)
     for (mut transform, planet) in planets.iter_mut() {
-        transform.translation.y = planet.base_y + (t * planet.bob_speed).sin() * 15.0;
-        transform.rotation = Quat::from_rotation_z(planet.base_rotation + t * planet.spin_speed);
+        let bob = (t * planet.bob_speed).sin() * 15.0;
+        let wobble = (t * planet.bob_speed * 0.5).sin() * 0.05;
+        transform.translation.y = bob;
+        transform.rotation = Quat::from_rotation_z(wobble);
+    }
+
+    // Clouds should rotate (subtle rotation drift)
+    for (mut transform, cloud) in clouds.iter_mut() {
+        let rotation = (t * cloud.speed + cloud.phase).sin() * 0.02;
+        transform.rotation = Quat::from_rotation_z(rotation);
     }
 }
 
-// Custom Mesh Generators
+fn scale_svg_to_window(
+    mut query: Query<&mut Transform, With<bevy_ecs_svg::SvgHierarchyLoaded>>,
+    cameras: Query<&Camera, With<Camera2d>>,
+) {
+    let Some(camera) = cameras.iter().next() else { return };
+    let Some(viewport_size) = camera.logical_viewport_size() else { return };
+    
+    let cam_w = viewport_size.x;
+    let cam_h = viewport_size.y;
+    
+    if cam_w == 0.0 || cam_h == 0.0 { return; }
 
-fn create_star_mesh(radius: f32) -> Mesh {
-    let mut positions = Vec::new();
-    let mut indices = Vec::new();
-    let segments = 32;
+    // shell.svg original size is 5120 x 2160
+    let svg_w = 5120.0;
+    let svg_h = 2160.0;
 
-    positions.push([0.0, 0.0, 0.0]); // Center
+    // Stretch to fit the resolution perfectly
+    let scale_x = cam_w / svg_w;
+    let scale_y = cam_h / svg_h;
 
-    for i in 0..segments {
-        let t = (i as f32) * std::f32::consts::TAU / (segments as f32);
-        let x = radius * t.cos().powi(3);
-        let y = radius * t.sin().powi(3);
-        positions.push([x, y, 0.0]);
+    for mut transform in query.iter_mut() {
+        transform.scale = Vec3::new(scale_x, scale_y, 1.0);
     }
-
-    for i in 0..segments {
-        let a = 0;
-        let b = i + 1;
-        let c = if i == segments - 1 { 1 } else { i + 2 };
-        indices.push(a);
-        indices.push(b);
-        indices.push(c);
-    }
-
-    Mesh::new(
-        bevy::render::render_resource::PrimitiveTopology::TriangleList,
-        bevy::asset::RenderAssetUsages::default(),
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_indices(bevy::mesh::Indices::U32(indices))
-}
-
-fn create_crescent_mesh(is_top: bool) -> Mesh {
-    let mut positions = Vec::new();
-    let mut indices = Vec::new();
-    let segments = 200;
-    let r = 80.0_f32;
-
-    let a = 160.0_f32;
-    let b = 50.0_f32;
-    let alpha = 22.0_f32.to_radians();
-
-    let big_a = alpha.sin().powi(2) / a.powi(2) + alpha.cos().powi(2) / b.powi(2);
-
-    for i in 0..=segments {
-        let x = -r + 2.0 * r * (i as f32) / (segments as f32);
-        let y_circ = (r.powi(2) - x.powi(2)).max(0.0).sqrt();
-
-        let big_b = 2.0 * x * alpha.sin() * alpha.cos() * (1.0 / a.powi(2) - 1.0 / b.powi(2));
-        let big_c = x.powi(2) * alpha.cos().powi(2) / a.powi(2)
-            + x.powi(2) * alpha.sin().powi(2) / b.powi(2)
-            - 1.0;
-
-        let disc = big_b.powi(2) - 4.0 * big_a * big_c;
-        let mut y_ell_top = 0.0;
-        let mut y_ell_bot = 0.0;
-
-        if disc >= 0.0 {
-            y_ell_top = (-big_b + disc.sqrt()) / (2.0 * big_a);
-            y_ell_bot = (-big_b - disc.sqrt()) / (2.0 * big_a);
-        }
-
-        if is_top {
-            if y_ell_top <= y_circ {
-                positions.push([x, y_ell_top, 0.0]);
-                positions.push([x, y_circ, 0.0]);
-            } else {
-                positions.push([x, y_circ, 0.0]);
-                positions.push([x, y_circ, 0.0]);
-            }
-        } else {
-            if -y_circ <= y_ell_bot {
-                positions.push([x, -y_circ, 0.0]);
-                positions.push([x, y_ell_bot, 0.0]);
-            } else {
-                positions.push([x, -y_circ, 0.0]);
-                positions.push([x, -y_circ, 0.0]);
-            }
-        }
-    }
-
-    for i in 0..segments {
-        let p1 = i * 2;
-        let p2 = i * 2 + 1;
-        let p3 = i * 2 + 2;
-        let p4 = i * 2 + 3;
-
-        indices.extend_from_slice(&[p1, p2, p3]);
-        indices.extend_from_slice(&[p3, p2, p4]);
-    }
-
-    Mesh::new(
-        bevy::render::render_resource::PrimitiveTopology::TriangleList,
-        bevy::asset::RenderAssetUsages::default(),
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_indices(bevy::mesh::Indices::U32(indices))
-}
-
-fn create_custom_ring_mesh() -> Mesh {
-    let mut positions = Vec::new();
-    let mut indices = Vec::new();
-    let segments = 200;
-
-    let a_in = 130.0;
-    let b_in = 20.0;
-    let a_out = 150.0;
-    let b_out = 40.0;
-    let alpha = 22.0_f32.to_radians();
-
-    let t_start = 20.0_f32.to_radians();
-    let t_end = 340.0_f32.to_radians();
-
-    for i in 0..=segments {
-        let t = t_start + (t_end - t_start) * (i as f32) / (segments as f32);
-
-        let u_in = a_in * t.cos();
-        let v_in = b_in * t.sin();
-        let mut u_out = a_out * t.cos();
-        let v_out = b_out * t.sin();
-
-        let dist_to_pi = (t - std::f32::consts::PI).abs();
-        if dist_to_pi < 0.5 {
-            let wing = (1.0 - dist_to_pi / 0.5).powi(2) * 80.0;
-            u_out -= wing;
-        }
-
-        let x_in = u_in * alpha.cos() - v_in * alpha.sin();
-        let y_in = u_in * alpha.sin() + v_in * alpha.cos();
-        let x_out = u_out * alpha.cos() - v_out * alpha.sin();
-        let y_out = u_out * alpha.sin() + v_out * alpha.cos();
-
-        positions.push([x_out, y_out, 0.0]);
-        positions.push([x_in, y_in, 0.0]);
-    }
-
-    for i in 0..segments {
-        let p1 = i * 2;
-        let p2 = i * 2 + 1;
-        let p3 = i * 2 + 2;
-        let p4 = i * 2 + 3;
-
-        indices.extend_from_slice(&[p1, p2, p3]);
-        indices.extend_from_slice(&[p3, p2, p4]);
-    }
-
-    Mesh::new(
-        bevy::render::render_resource::PrimitiveTopology::TriangleList,
-        bevy::asset::RenderAssetUsages::default(),
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_indices(bevy::mesh::Indices::U32(indices))
-}
-
-fn create_wave_mesh(
-    width: f32,
-    base_y: f32,
-    amplitude: f32,
-    frequency: f32,
-    phase: f32,
-    bottom_y: f32,
-) -> Mesh {
-    let mut positions = Vec::new();
-    let mut indices = Vec::new();
-    let segments = 100;
-
-    for i in 0..=segments {
-        let normalized_x = (i as f32) / (segments as f32);
-        let x = -width / 2.0 + normalized_x * width;
-        let wave_y =
-            base_y + amplitude * (frequency * normalized_x * std::f32::consts::TAU + phase).sin();
-
-        positions.push([x, wave_y, 0.0]);
-        positions.push([x, bottom_y, 0.0]);
-    }
-
-    for i in 0..segments {
-        let p1 = i * 2;
-        let p2 = i * 2 + 1;
-        let p3 = i * 2 + 2;
-        let p4 = i * 2 + 3;
-
-        indices.extend_from_slice(&[p1, p2, p3]);
-        indices.extend_from_slice(&[p3, p2, p4]);
-    }
-
-    Mesh::new(
-        bevy::render::render_resource::PrimitiveTopology::TriangleList,
-        bevy::asset::RenderAssetUsages::default(),
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_indices(bevy::mesh::Indices::U32(indices))
 }
